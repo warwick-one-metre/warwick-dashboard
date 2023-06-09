@@ -1,0 +1,12 @@
+[Unit]
+Description=uWSGI instance to serve the web dashboard
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/dashboard/
+ExecStart=/usr/bin/uwsgi --ini /var/www/dashboard/dashboard.ini
+
+[Install]
+WantedBy=multi-user.target

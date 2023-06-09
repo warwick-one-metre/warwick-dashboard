@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+#
+# This file is part of dashboard.
+#
+# dashboard is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# dashboard is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with dashboard.  If not, see <http://www.gnu.org/licenses/>.
+
+# pylint: disable=broad-except
+# pylint: disable=invalid-name
+
+"""Polls observatory webcams and updates the cached dashboard images"""
+
+import hashlib
+from io import BytesIO
+import json
+import netrc
+import requests
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+import os
+import re
+import sys
+import traceback
+
+from astropy.time import Time
+from PIL import Image
+import astropy.units as u
+
+BASE_OUTPUT_DIR = '/var/www/dashboard/generated/'
+EUMETSAT_URL = 'https://eumetview.eumetsat.int/static-images/MSG/IMAGERY/IR108/BW/WESTERNEUROPE/'
+DOME_URL = 'http://172.19.0.163/cgi-bin/snapshot.cgi'
+ACP_URL = 'http://172.19.0.160/images/lastimage.png'
+TIME_UNKNOWN = Time('2000-01-01T12:00:00')
+
+
+def scrape_eumetsat_info(timeout=5):
+    """
+    Scrapes the EUMETSAT website to find the URL and date for the latest image
+        :param timeout: http timeout
+        :return: dictionary containing keys for 'date' and 'url' or None on error
+    """
+    try:
+        r = requests.get(EUMETSAT_URL, timeout=timeout)
+        if r.status_code != 200:
+            print('Failed to scrape data for {0} (HTTP {1})'.format(EUMETSAT_URL, r.status_code))
+            return TIME_UNKNOWN, None
+
+        id_search = re.search(r'array_nom_imagen\[0\]="(\w*)"', r.text)
+        label_search = re.search(r'\<option value="0"\>(.*)\<\/option\>', r.text)
+
+        if not id_search:
+            print('Failed to extract image id from html')
+            return TIME_UNKNOWN, None
+
+        if not label_search:
+            print('Failed to extract image label from html')
+            return TIME_UNKNOWN, None
+
+        try:
+            return (Time.strptime(label_search.group(1), "%d/%m/%y %H:%M UTC"),
+                    EUMETSAT_URL + 'IMAGESDisplay/' + id_search.group(1))
+
+        except ValueError:
+            print('Failed to parse `{0}` as a date'.format(label_search.group(1)))
+            return TIME_UNKNOWN, None
+
+    except Exception:
+        print('Failed to scrape image data with exception:')
+        traceback.print_exc(file=sys.stdout)
+        return TIME_UNKNOWN, None
+
+
+def fetch_eumetsat_image(image_url, timeout=5):
+    """
+    Download the given EUMETSAT WESTERNEUROPE image and crop to focus on the UK
+        :param image_url: Image URL to download
+        :param timeout: http timeout
+        :return PIL Image or None on error
+    """
+    try:
+        r = requests.get(image_url, timeout=timeout)
+        if r.status_code != 200:
+            print('Failed to fetch image `{0}` (HTTP {1})'.format(image_url, r.status_code))
+            return None
+
+        source = Image.open(BytesIO(r.content))
+
+        # Crop to the UK
+        cropped = source.crop((162, 0, 162+960, 540))
+
+        # Copy EUMETSAT watermark and metadata to bottom of cropped image
+        cropped.paste(source.crop((0, 852, 960, 892)), (0, 500, 960, 540))
+        cropped.paste(source.crop((728, 852, 1273, 892)), (415, 500, 960, 540))
+
+        return cropped
+    except Exception:
+        print('Failed to fetch image `{0}` with exception:'.format(image_url))
+        traceback.print_exc(file=sys.stdout)
+        return None
+
+
+def fetch_dome_image(timeout=5):
+    try:
+        auth = netrc.netrc()
+        name, _, password = auth.authenticators('dome_webcam')
+        r = requests.get(DOME_URL, timeout=timeout, auth=HTTPDigestAuth(name, password))
+        if r.status_code != 200:
+            print('Failed to fetch image `{0}` (HTTP {1})'.format(DOME_URL, r.status_code))
+            return None
+
+        return Image.open(BytesIO(r.content))
+    except Exception:
+        print('Failed to fetch image `{0}` with exception:'.format(DOME_URL))
+        traceback.print_exc(file=sys.stdout)
+        return None
+
+
+def fetch_acp_image(last_sha1, timeout=5):
+    try:
+        auth = netrc.netrc()
+        name, _, password = auth.authenticators('acp')
+        r = requests.get(ACP_URL, timeout=timeout, auth=HTTPBasicAuth(name, password))
+        if r.status_code != 200:
+            print('Failed to fetch image `{0}` (HTTP {1})'.format(ACP_URL, r.status_code))
+            return None, last_sha1
+
+        data = BytesIO(r.content)
+        sha1 = hashlib.sha1(data.getbuffer()).hexdigest()
+        if sha1 == last_sha1:
+            return None, last_sha1
+        return Image.open(data), sha1
+    except Exception:
+        print('Failed to fetch image `{0}` with exception:'.format(ACP_URL))
+        traceback.print_exc(file=sys.stdout)
+        return None, last_sha1
+
+try:
+    with open(os.path.join(BASE_OUTPUT_DIR, 'metadata.json'), 'r', encoding='utf-8') as infile:
+        data = json.load(infile)
+        eumetsat_updated = Time(data['eumetsat_updated'])
+        eumetsat_polled = Time(data['eumetsat_polled'])
+        acp_image_sha1 = data['acp_image_sha1']
+
+except Exception:
+    eumetsat_updated = TIME_UNKNOWN
+    eumetsat_polled = TIME_UNKNOWN
+    acp_image_sha1 = ''
+
+# EUMETSAT has a minimum cadence of 15 minutes, often 30 or 60 minutes
+if eumetsat_updated + 15 * u.minute < Time.now() and eumetsat_polled + 1 * u.minute < Time.now():
+    eumetsat_date, eumetsat_url = scrape_eumetsat_info()
+    eumetsat_polled = Time.now()
+    if eumetsat_date > eumetsat_updated:
+        eumetsat_image = fetch_eumetsat_image(eumetsat_url)
+        if eumetsat_image:
+            eumetsat_image.save(os.path.join(BASE_OUTPUT_DIR, 'eumetsat.jpg'), 'JPEG', quality=80,
+                                optimize=True, progressive=True, clobber=True)
+
+            eumetsat_updated = eumetsat_date
+
+# Update local webcams every call
+
+webcam_image = fetch_dome_image()
+if webcam_image:
+    webcam_image.save(os.path.join(BASE_OUTPUT_DIR, 'dome.jpg'), 'JPEG', quality=80,
+                      optimize=True, progressive=True, clobber=True)
+
+telescope_image, acp_image_sha1 = fetch_acp_image(acp_image_sha1)
+if telescope_image:
+    telescope_image.save(os.path.join(BASE_OUTPUT_DIR, 'telescope.jpg'), 'JPEG', quality=80,
+                      optimize=True, progressive=True, clobber=True)
+
+with open(os.path.join(BASE_OUTPUT_DIR, 'metadata.json'), 'w', encoding='utf-8') as outfile:
+    json.dump({
+        'eumetsat_updated': eumetsat_updated.isot,
+        'eumetsat_polled': eumetsat_polled.isot,
+        'acp_image_sha1': acp_image_sha1
+    }, outfile)

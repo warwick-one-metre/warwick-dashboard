@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+#
+# This file is part of dashboard.
+#
+# dashboard is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# dashboard is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with environmentd.  If not, see <http://www.gnu.org/licenses/>.
+
+# pylint: disable=broad-except
+# pylint: disable=invalid-name
+
+"""Run from a systemd timer to generate status json that is served by the web dashboard"""
+
+import datetime
+import json
+from warwick.observatory.common import daemons, log
+
+# This directory must be shared with the TCS via NFS
+BASE_OUTPUT_DIR = '/var/www/dashboard/generated'
+STATUS_FILE = BASE_OUTPUT_DIR + '/update-dashboard-data.json'
+
+try:
+    with open(STATUS_FILE, 'r') as infile:
+        status = json.load(infile)
+except Exception:
+    status = {}
+
+
+def query_daemon(daemon, key, query):
+    """Query status data from a daemon setting / clearing error flags on failure"""
+    try:
+        with daemon.connect() as d:
+            response = query(d)
+
+        # Some daemons will return None on error
+        if response is None:
+            if not key in status or status[key]:
+                print('received empty response from ' + key + '')
+                log.error('dashboardd', 'Lost contact with ' + key + ' (empty response)')
+            status[key] = False
+        else:
+            if key in status and not status[key]:
+                log.info('dashboardd', 'Restored contact with ' + key)
+            status[key] = True
+            return response
+    except Exception as e:
+        print('failed to query ' + key + ' with error: ' + str(e))
+        if not key in status or status[key]:
+            log.error('dashboardd', 'Lost contact with ' + key + ' (' + str(e) + ')')
+        status[key] = False
+
+    return None
+
+
+def extract_environment_data(data, data_map):
+    """Extract weather data from the observatory_environment response
+       data_map defines a dictionary of daemons and sensors that are requested
+    """
+    try:
+        ret = {}
+        for daemon, sensors in data_map.items():
+            ret[daemon] = {}
+            if daemon not in data or 'parameters' not in data[daemon]:
+                continue
+
+            daemon_data = data[daemon]['parameters']
+            for sensor in sensors:
+                ret[daemon][sensor] = {}
+                if daemon_data[sensor]['current']:
+                    for s in ['latest', 'min', 'max', 'limits', 'warn_limits']:
+                        if s in daemon_data[sensor]:
+                            ret[daemon][sensor][s] = daemon_data[sensor][s]
+        return ret
+    except:
+        return {}
+
+
+def generate_json(output_path, date):
+    """Queries the observatory environment daemon and saves as json
+       the data useful for the GOTO dashboard page
+    """
+    output = {'date': date}
+    environment = query_daemon(daemons.warwick_environment, 'environment', lambda d: d.status())
+    if environment:
+        output.update(extract_environment_data(environment, {
+            'vaisala': [
+                'wind_speed', 'median_wind_speed', 'temperature', 'relative_humidity', 'dew_point_delta',
+                'pressure'
+            ],
+            'rain': ['unsafe_sensors'],
+            'internal': ['temperature', 'humidity'],
+            'cloudwatcher': ['sky_temp'],
+            'diskspace': ['data_fs_available_bytes'],
+            'ephem': ['sun_alt', 'moon_alt', 'moon_percent_illumination']
+        }))
+
+    output['power'] = query_daemon(daemons.warwick_power, 'power', lambda d: d.last_measurement())
+    output['acp'] = query_daemon(daemons.warwick_acp_monitor, 'acp', lambda d: d.last_measurement())
+    output['dome'] = query_daemon(daemons.warwick_dome, 'dome', lambda d: d.status())
+    output['operations'] = query_daemon(daemons.warwick_operations, 'operations', lambda d: d.status())
+
+    try:
+        with open(output_path, 'w') as output_file:
+            json.dump(output or {}, output_file)
+
+        with open(STATUS_FILE, 'w') as output_file:
+            json.dump(status, output_file)
+    except Exception as e:
+        print('failed to write json with error: ' + str(e))
+        log.error('dashboardd', 'Failed to write json (' + str(e) + ')')
+
+
+date = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')
+generate_json(BASE_OUTPUT_DIR + '/dashboard.json', date)
